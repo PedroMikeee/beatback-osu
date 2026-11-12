@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beatback"
+version = "0.1.0"
+description = "Recupera los mapas de osu! que has jugado, descargándolos por bloques"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+dependencies = ["requests"]
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+beatback = "beatback.cli:main"
+
+[tool.setuptools]
+packages = ["beatback"]
