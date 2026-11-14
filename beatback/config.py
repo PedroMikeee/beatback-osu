@@ -12,7 +12,7 @@ DEFAULTS = {
     "output_dir": str(Path.home() / "BeatBack"),
     "block_size": 150,        # mapas por carpeta (bloque)
     "no_video": True,         # descargar sin video (mucho más liviano)
-    "concurrency": 2,         # descargas simultáneas (no subir: los mirrors limitan)
+    "concurrency": 3,         # descargas simultáneas (si ves errores 429, bájalo a 2)
     "min_interval": 2.0,      # segundos mínimos entre peticiones al mismo mirror
     "api_base": "https://osu.ppy.sh",
     "api_interval": 1.0,      # pausa entre páginas de la API

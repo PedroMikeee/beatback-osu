@@ -38,6 +38,11 @@ class MirrorPool:
         with self.lock:
             m["next"] = max(m["next"], time.monotonic() + secs)
 
+    def ordered(self):
+        """Mirrors ordenados por disponibilidad: el que lleva más tiempo sin usarse va primero."""
+        with self.lock:
+            return sorted(self.items, key=lambda m: m["next"])
+
     def soonest(self):
         with self.lock:
             return max(0.0, min(m["next"] for m in self.items) - time.monotonic())
@@ -69,10 +74,10 @@ def _save(r, dest: Path):
 
 
 def fetch_set(set_id, dest: Path, pool: MirrorPool, session, rounds=4):
-    """Devuelve (estado, detalle): done | not_found | failed."""
+    """Devuelve (estado, detalle, mirror): done | not_found | failed."""
     errors, gone = [], set()
     for rnd in range(rounds):
-        for m in pool.items:
+        for m in pool.ordered():
             if m["name"] in gone:
                 continue
             wait = pool.reserve(m)
@@ -91,7 +96,7 @@ def fetch_set(set_id, dest: Path, pool: MirrorPool, session, rounds=4):
                 if r.status_code == 200:
                     ok, info = _save(r, dest)
                     if ok:
-                        return "done", info
+                        return "done", info, m["name"]
                     errors.append(f"{m['name']}: {info}")
                 elif r.status_code in (404, 410):
                     gone.add(m["name"])
@@ -102,10 +107,10 @@ def fetch_set(set_id, dest: Path, pool: MirrorPool, session, rounds=4):
                 else:
                     errors.append(f"{m['name']}: HTTP {r.status_code}")
         if len(gone) == len(pool.items):
-            return "not_found", "ningún mirror tiene este mapa"
+            return "not_found", "ningún mirror tiene este mapa", None
         if rnd < rounds - 1:      # espera a que se libere algún mirror y reintenta
             time.sleep(min(max(pool.soonest(), 1.0), 300.0))
-    return "failed", "; ".join(errors[-4:]) or "sin respuesta"
+    return "failed", "; ".join(errors[-4:]) or "sin respuesta", None
 
 
 def safe_name(artist, title, sid):
@@ -117,42 +122,63 @@ def dest_for(out_dir, row):
     return Path(out_dir) / f"bloque_{row['block']:03d}" / safe_name(row["artist"], row["title"], row["id"])
 
 
+def _fmt_time(secs):
+    secs = int(secs)
+    h, r = divmod(secs, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{sec:02d}s" if m else f"{sec}s")
+
+
 def run(cfg, state, rows, stop: threading.Event, say=print):
-    """Descarga las filas con N hilos. Cada resultado se guarda en la base apenas termina."""
+    """Descarga las filas con N hilos. Cada resultado se guarda en la base apenas termina.
+    Devuelve (conteos, estadísticas)."""
     pool = MirrorPool(cfg["mirrors"], cfg["no_video"], cfg["min_interval"])
     local = threading.local()
-    total, done_n, counts = len(rows), 0, {"done": 0, "not_found": 0, "failed": 0}
+    total, done_n = len(rows), 0
+    counts = {"done": 0, "not_found": 0, "failed": 0}
+    stats = {"mirrors": {}, "bytes": 0, "secs": 0.0}
+    t0 = time.monotonic()
 
     def job(row):
         if stop.is_set():
-            return row, None
+            return row, None, 0.0
         dest = dest_for(cfg["output_dir"], row)
         if dest.exists() and dest.stat().st_size >= MIN_SIZE:      # ya estaba en disco
-            return row, ("done", dest.stat().st_size)
+            return row, ("done", dest.stat().st_size, "disco"), 0.0
         if not hasattr(local, "s"):
             local.s = requests.Session()
-        return row, fetch_set(row["id"], dest, pool, local.s)
+        start = time.monotonic()
+        res = fetch_set(row["id"], dest, pool, local.s)
+        return row, res, time.monotonic() - start
 
     ex = ThreadPoolExecutor(max_workers=max(1, int(cfg["concurrency"])))
     try:
         for fut in as_completed([ex.submit(job, r) for r in rows]):
-            row, res = fut.result()
+            row, res, secs = fut.result()
             if res is None:
                 continue
-            st, info = res
+            st, info, mirror = res
             done_n += 1
             counts[st] += 1
             dest = str(dest_for(cfg["output_dir"], row))
             if st == "done":
-                state.mark(row["id"], "done", path=dest, size=info)
+                state.mark(row["id"], "done", path=dest, size=info, mirror=mirror, secs=round(secs, 2))
+                stats["bytes"] += info
+                stats["mirrors"][mirror] = stats["mirrors"].get(mirror, 0) + 1
+                mb = info / 1048576
+                speed = f", {mb / secs:.1f} MB/s" if secs > 0.05 and mirror != "disco" else ""
+                extra = f"  ({mb:.1f} MB, {mirror}{speed})"
             else:
                 state.mark(row["id"], st, error=info)
+                extra = f"  ({info})"
+            elapsed = time.monotonic() - t0
+            eta = f"  ~{_fmt_time((total - done_n) * elapsed / done_n)} restantes" if done_n >= 3 and done_n < total else ""
             tag = {"done": "OK ", "not_found": "NO ", "failed": "ERR"}[st]
-            extra = "" if st == "done" else f"  ({info})"
-            say(f"[{done_n}/{total}] {tag} {row['id']} {row['artist']} - {row['title']}{extra}")
+            say(f"[{done_n}/{total}] {tag} {row['id']} {row['artist']} - {row['title']}{extra}{eta}")
     except KeyboardInterrupt:
         stop.set()
         say("\nInterrumpido. Lo descargado queda guardado; vuelve a ejecutar 'download' para continuar.")
     finally:
         ex.shutdown(wait=True, cancel_futures=True)
-    return counts
+    stats["secs"] = time.monotonic() - t0
+    return counts, stats

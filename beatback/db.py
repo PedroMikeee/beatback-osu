@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS sets(
   id INTEGER PRIMARY KEY, artist TEXT, title TEXT, creator TEXT, status TEXT,
   year INTEGER, playcount INTEGER, stars REAL, block INTEGER,
   state TEXT NOT NULL DEFAULT 'pending',   -- pending | done | failed | not_found
-  error TEXT, path TEXT, bytes INTEGER, updated TEXT)
+  error TEXT, path TEXT, bytes INTEGER, updated TEXT, mirror TEXT, secs REAL)
 """
 
 
@@ -17,6 +17,11 @@ class State:
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
         self.db.execute(SCHEMA)
+        # Migración desde la versión 0.1 (sin las columnas mirror y secs): no se pierde el historial.
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(sets)")}
+        for col, typ in (("mirror", "TEXT"), ("secs", "REAL")):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE sets ADD COLUMN {col} {typ}")
         self.db.commit()
 
     def save_plan(self, rows):
@@ -47,10 +52,30 @@ class State:
             q += f" LIMIT {int(limit)}"
         return [dict(r) for r in self.db.execute(q, args)]
 
-    def mark(self, sid, state, error=None, path=None, size=None):
-        self.db.execute("UPDATE sets SET state=?, error=?, path=?, bytes=?, updated=? WHERE id=?",
-                        (state, error, path, size, time.strftime("%Y-%m-%d %H:%M:%S"), sid))
+    def mark(self, sid, state, error=None, path=None, size=None, mirror=None, secs=None):
+        self.db.execute("UPDATE sets SET state=?, error=?, path=?, bytes=?, mirror=?, secs=?, updated=? WHERE id=?",
+                        (state, error, path, size, mirror, secs, time.strftime("%Y-%m-%d %H:%M:%S"), sid))
         self.db.commit()
+
+    def avg_done_mb(self):
+        """(tamaño medio en MB, cantidad) de lo ya descargado: sirve para estimar mejor."""
+        n, avg = self.db.execute("SELECT COUNT(*), AVG(bytes) FROM sets WHERE state='done' AND bytes > 0").fetchone()
+        return ((avg or 0) / 1048576, n)
+
+    def list_rows(self, estado=None, block=None, orden="jugadas", limit=50):
+        order = {"jugadas": "playcount DESC, id", "id": "id", "anio": "year DESC, id",
+                 "estrellas": "stars DESC, id"}[orden]
+        where, args = [], []
+        if estado:
+            where.append("state=?")
+            args.append(estado)
+        if block:
+            where.append("block=?")
+            args.append(block)
+        w = ("WHERE " + " AND ".join(where)) if where else ""
+        total = self.db.execute(f"SELECT COUNT(*) FROM sets {w}", args).fetchone()[0]
+        q = f"SELECT * FROM sets {w} ORDER BY {order}" + (f" LIMIT {int(limit)}" if limit else "")
+        return [dict(r) for r in self.db.execute(q, args)], total
 
     def counts(self):
         return {r[0]: r[1] for r in self.db.execute("SELECT state, COUNT(*) FROM sets GROUP BY state")}

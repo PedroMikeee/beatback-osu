@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from beatback import cli, config
+from beatback.db import State
 from beatback.api import ApiError, OsuClient
 from beatback.planner import aggregate, plan
 
@@ -212,6 +213,67 @@ class TestFlujoCompleto(Base):
         self.cfg()
         mode = (config.config_dir() / "config.json").stat().st_mode & 0o777
         self.assertEqual(mode, 0o600)
+
+
+class TestVersion02(Base):
+    def test_reparte_entre_mirrors_y_registra_cual_sirvio(self):
+        self.cfg()
+        self.run_cli("plan")
+        out = self.run_cli("download")
+        self.assertIn("Por mirror", out)
+        rows = State(config.config_dir() / "beatback.db").all_rows()
+        usados = {r["mirror"] for r in rows if r["state"] == "done"}
+        self.assertEqual(usados, {"m1", "m2"})                  # ya no usa siempre el primero
+        self.assertTrue(all(r["bytes"] for r in rows if r["state"] == "done"))
+
+    def test_list_muestra_sin_descargar(self):
+        self.cfg()
+        self.run_cli("plan")
+        out = self.run_cli("list", "--limite", "5")
+        self.assertIn("Mostrando 5 de 102", out)
+        self.assertIn("pending", out)
+        self.assertEqual(list(self.out.rglob("*.osz")) if self.out.exists() else [], [])   # nada descargado
+        self.assertIn("Mostrando 102 de 102", self.run_cli("list", "--limite", "0"))
+
+    def test_list_filtra_por_estado(self):
+        self.cfg()
+        self.run_cli("plan", "--prueba", "3")
+        self.run_cli("download")
+        self.assertIn("Mostrando 1 de 1", self.run_cli("list", "--estado", "not_found"))
+        self.assertIn("Mostrando 2 de 2", self.run_cli("list", "--estado", "done"))
+
+    def test_migracion_desde_0_1_conserva_el_historial(self):
+        import sqlite3
+        d = config.config_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(d / "beatback.db")
+        con.execute("CREATE TABLE sets(id INTEGER PRIMARY KEY, artist TEXT, title TEXT, creator TEXT, status TEXT,"
+                    " year INTEGER, playcount INTEGER, stars REAL, block INTEGER, state TEXT NOT NULL DEFAULT 'pending',"
+                    " error TEXT, path TEXT, bytes INTEGER, updated TEXT)")
+        con.execute("INSERT INTO sets(id,artist,title,state,bytes,block,playcount) VALUES(7,'A','T','done',3145728,1,9)")
+        con.commit()
+        con.close()
+        st = State(d / "beatback.db")                 # abre la base vieja sin romperse
+        rows = st.all_rows()
+        self.assertEqual((rows[0]["id"], rows[0]["state"]), (7, "done"))
+        self.assertIn("mirror", rows[0])
+        avg, n = st.avg_done_mb()
+        self.assertEqual((round(avg), n), (3, 1))
+
+    def test_export_incluye_mirror_y_tamano(self):
+        self.cfg()
+        self.run_cli("plan", "--prueba", "3")
+        self.run_cli("download")
+        p = Path(self.tmp.name) / "h.csv"
+        self.run_cli("export", str(p))
+        with open(p, encoding="utf-8") as fh:
+            filas = list(csv.DictReader(fh))
+        self.assertTrue({"mirror", "bytes", "updated"} <= set(filas[0]))
+        self.assertTrue(any(f["mirror"] in ("m1", "m2") for f in filas))
+
+    def test_formato_de_tamano(self):
+        self.assertEqual(cli.fmt_size(15), "15 MB")
+        self.assertEqual(cli.fmt_size(2048), "2.0 GB")
 
 
 if __name__ == "__main__":
