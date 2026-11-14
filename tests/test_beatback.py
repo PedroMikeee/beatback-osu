@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from collections import Counter
@@ -51,6 +52,8 @@ ZIP_BYTES = ZIP_BYTES.getvalue()
 class Fake(BaseHTTPRequestHandler):
     seen_429 = set()
     hits = Counter()
+    agents = []
+    budget = 10
     lock = threading.Lock()
 
     def log_message(self, *a):
@@ -83,11 +86,21 @@ class Fake(BaseHTTPRequestHandler):
                 q = parse_qs(u.query)
                 off, lim = int(q["offset"][0]), int(q["limit"][0])
                 return self._send(200, json.dumps(ITEMS[off:off + lim]).encode())
-        m = re.match(r"/(m1|m2|m3)/d/(\d+)", u.path)
+        m = re.match(r"/(m1|m2|m3|m4|m4s)/d/(\d+)", u.path)
         if m:
             mirror, sid = m.group(1), int(m.group(2))
             with Fake.lock:
                 Fake.hits[mirror] += 1
+                Fake.agents.append(self.headers.get("User-Agent", ""))
+            if mirror == "m4":                                   # como osu.direct: redirige y informa el cupo
+                if sid == NOT_FOUND:
+                    return self._send(404)
+                with Fake.lock:
+                    Fake.budget -= 1
+                    left = Fake.budget
+                return self._send(302, headers={"Location": f"/m4s/d/{sid}", "X-Download-Budget-Limit": "10",
+                                                "X-Download-Budget-Remaining": str(left),
+                                                "X-Download-Budget-Reset": str(int(time.time()) + 3600)})
             if mirror == "m3":
                 return self._send(500)                          # mirror caído
             if mirror == "m1" and 1050 <= sid <= 1059:          # corte a mitad de la descarga
@@ -124,16 +137,18 @@ class Base(unittest.TestCase):
     def setUp(self):
         Fake.seen_429.clear()
         Fake.hits.clear()
+        Fake.agents.clear()
+        Fake.budget = 10
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["BEATBACK_HOME"] = str(Path(self.tmp.name) / "cfg")
         self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name) / "salida"
 
-    def cfg(self, mirrors=("m1", "m2")):
+    def cfg(self, mirrors=("m1", "m2"), tiers=None):
         c = config.load(use_env=False)
         c.update(client_id="123", client_secret="s", username="tester", api_base=self.base,
                  api_interval=0, min_interval=0, concurrency=2, block_size=50, output_dir=str(self.out),
-                 mirrors=[{"name": n, "url_novideo": f"{self.base}/{n}/d/{{id}}?nv=1",
+                 mirrors=[{"name": n, "tier": (tiers or {}).get(n, 0), "url_novideo": f"{self.base}/{n}/d/{{id}}?nv=1",
                            "url_full": f"{self.base}/{n}/d/{{id}}"} for n in mirrors])
         config.save(c)
         return c
@@ -351,6 +366,89 @@ class TestVersion021(Base):
         t0 = time.monotonic()
         self.run_cli("download", "--concurrencia", "1")
         self.assertLess(time.monotonic() - t0, 30)      # antes se quedaba esperando minutos
+
+
+class TestVersion022(Base):
+    def test_se_identifica_con_nombre_version_y_direccion(self):
+        from beatback import USER_AGENT
+        self.cfg()
+        self.run_cli("plan", "--prueba", "4")
+        self.run_cli("download")
+        self.assertTrue(Fake.agents)
+        self.assertTrue(all(a == USER_AGENT for a in Fake.agents))
+        self.assertRegex(USER_AGENT, r"^BeatBack/\d+\.\d+\.\d+ \(\+https://")
+
+    def test_los_mirrors_de_respaldo_no_se_usan_si_los_principales_funcionan(self):
+        self.cfg(mirrors=("m2", "m4"), tiers={"m2": 0, "m4": 1})
+        self.run_cli("plan", "--prueba", "12")
+        self.run_cli("download")
+        self.assertGreater(Fake.hits["m2"], 0)
+        # m4 solo se consulta por el mapa 900, que m2 no tiene; no sirve ninguna descarga normal
+        self.assertEqual(Fake.hits["m4"], 1)
+        rows = State(config.config_dir() / "beatback.db").all_rows()
+        self.assertEqual({r["mirror"] for r in rows if r["state"] == "done"}, {"m2"})
+
+    def test_el_respaldo_entra_cuando_el_principal_falla(self):
+        self.cfg(mirrors=("m3", "m4"), tiers={"m3": 0, "m4": 1})
+        self.run_cli("plan", "--prueba", "8")
+        out = self.run_cli("download", "--concurrencia", "1")
+        rows = State(config.config_dir() / "beatback.db").all_rows()
+        self.assertTrue(all(r["mirror"] == "m4" for r in rows if r["state"] == "done"))
+        self.assertIn("m3:HTTP500", out)
+
+    def test_orden_prefiere_nivel_bajo_pero_no_espera_a_uno_ocupado(self):
+        from beatback.downloader import MirrorPool
+        mirrors = [{"name": "rapido", "tier": 0, "url_novideo": "x", "url_full": "x"},
+                   {"name": "lento", "tier": 1, "url_novideo": "x", "url_full": "x"}]
+        pool = MirrorPool(mirrors, True, 2.0)
+        self.assertEqual([m["name"] for m in pool.ordered()], ["rapido", "lento"])
+        pool.penalize(pool.items[0], 60)                      # el preferido está en pausa un minuto
+        self.assertEqual([m["name"] for m in pool.ordered()], ["lento", "rapido"])
+
+    def test_lee_el_cupo_en_la_redireccion_y_lo_muestra_en_el_resumen(self):
+        self.cfg(mirrors=("m4",))
+        self.run_cli("plan", "--prueba", "4")                  # 900 (404), 901, 902, 1000
+        out = self.run_cli("download", "--concurrencia", "1")
+        self.assertIn("cupo restante 7/10", out)               # 3 descargas gastaron 3 de 10
+
+    def test_cupo_agotado_pausa_el_mirror_y_avisa(self):
+        from beatback.downloader import MirrorPool
+
+        class Resp:
+            def __init__(self, headers, history=()):
+                self.headers, self.history = headers, list(history)
+        pool = MirrorPool([{"name": "od", "url_novideo": "x", "url_full": "x"}], True, 0)
+        m = pool.items[0]
+        hop = Resp({"X-Download-Budget-Remaining": "1", "X-Download-Budget-Limit": "200",
+                    "X-Download-Budget-Reset": str(int(time.time()) + 3600)})
+        pool.note_headers(m, Resp({}, history=[hop]))           # la cabecera viene en la redirección, no en la final
+        self.assertEqual(m["budget"], "1/200")
+        self.assertIsNone(pool.reserve(m))                      # pausa larga: se salta
+        self.assertTrue(any("agotó su cupo de descargas" in e for e in pool.pop_events()))
+        # cupo diario de datos casi agotado
+        pool2 = MirrorPool([{"name": "od", "url_novideo": "x", "url_full": "x"}], True, 0)
+        pool2.note_headers(pool2.items[0], Resp({"X-Download-Budget-Bytes-Remaining": str(10 * 1048576),
+                                                 "X-Download-Budget-Bytes-Reset": str(int(time.time()) + 7200)}))
+        self.assertTrue(any("cupo diario de datos" in e for e in pool2.pop_events()))
+
+    def test_config_vieja_con_mirrors_antiguos_se_actualiza(self):
+        d = config.config_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.json").write_text(json.dumps({"client_id": "1", "concurrency": 2,
+                                                   "mirrors": config.LEGACY_MIRRORS}), encoding="utf-8")
+        cfg = config.load(use_env=False)
+        self.assertEqual(cfg["mirrors"], config.DEFAULTS["mirrors"])
+        self.assertEqual(cfg["mirrors"][0]["name"], "catboy")
+        self.assertEqual(cfg["concurrency"], 2)                  # lo demás se respeta
+        # una lista personalizada NO se toca
+        mine = [{"name": "mio", "url_novideo": "u{id}", "url_full": "u{id}"}]
+        (d / "config.json").write_text(json.dumps({"mirrors": mine}), encoding="utf-8")
+        self.assertEqual(config.load(use_env=False)["mirrors"], mine)
+
+    def test_guardar_no_congela_la_lista_por_defecto(self):
+        config.save(config.load(use_env=False))
+        guardado = json.loads((config.config_dir() / "config.json").read_text(encoding="utf-8"))
+        self.assertNotIn("mirrors", guardado)
 
 
 if __name__ == "__main__":

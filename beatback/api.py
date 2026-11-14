@@ -5,7 +5,7 @@ from urllib.parse import quote
 
 import requests
 
-UA = "BeatBack/0.1 (copia de seguridad personal)"
+from . import USER_AGENT as UA
 PAGE = 50  # tamaño de página: seguro frente a cualquier límite de la API
 
 

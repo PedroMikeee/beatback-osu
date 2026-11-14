@@ -107,8 +107,9 @@ def cmd_download(args):
     if stats["bytes"]:
         print(f"Total: {fmt_size(stats['bytes'] / 1048576)} en {downloader._fmt_time(stats['secs'])}.")
     print("Por mirror:")
-    for name, ok, err, miss in stats["pool"]:
-        print(f"  {name:<10} {ok} descargados, {err} errores, {miss} 'no lo tengo'")
+    for name, ok, err, miss, budget in stats["pool"]:
+        cupo = f", cupo restante {budget}" if budget else ""
+        print(f"  {name:<10} {ok} descargados, {err} errores, {miss} 'no lo tengo'{cupo}")
 
 
 def cmd_mirrors(args):
@@ -119,11 +120,12 @@ def cmd_mirrors(args):
     session = requests.Session()
     for m in cfg["mirrors"]:
         url = m["url_novideo" if cfg["no_video"] else "url_full"]
-        for sid in ids:
-            r = downloader.probe(url, sid, session)
+        # Los mirrors de respaldo (nivel > 0) gastan cupo en cada prueba: se prueban con un solo mapa.
+        for sid in (ids[:1] if m.get("tier", 0) > 0 and len(ids) > 1 else ids):
+            r = downloader.probe(url, sid, session, ua=cfg.get("user_agent"))
             mb = r["size"] / 1048576
             speed = f"{mb / r['secs']:.2f} MB/s" if r["size"] and r["secs"] > 0.05 else "-"
-            print(f"  {m['name']:<10} mapa {sid:<9} {r['verdict']:<34} {r['secs']:>5.1f} s  {mb:>5.1f} MB  {speed}", flush=True)
+            print(f"  {m['name']:<10} mapa {sid:<9} {r['verdict']:<34} {r['secs']:>5.1f} s  {mb:>5.1f} MB  {speed:<10} {r['budget']}", flush=True)
     print("Consejo: si un mirror falla o es muy lento con todos los mapas, déjalo al final de la lista 'mirrors' "
           "en config.json o usa: beatback download --mirror NOMBRE")
 

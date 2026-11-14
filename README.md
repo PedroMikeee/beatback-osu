@@ -49,11 +49,28 @@ filtran por el año de **publicación del mapa**, que solo es una aproximación.
 ## Si la descarga va lenta o falla
 
 1. Ejecuta `beatback mirrors`: prueba cada mirror con mapas de tu lista y muestra si responde, cuánto tarda y a qué MB/s.
-2. Si uno falla o es muy lento, descarga solo con los buenos: `beatback download --mirror sayobot`
-   (o deja el malo al final de la lista `mirrors` en `config.json`).
+2. Si uno falla o es muy lento, descarga solo con los buenos: `beatback download --mirror catboy sayobot`
+   (o cambia su `tier` en la lista `mirrors` de `config.json`).
 3. Durante la descarga, cada línea indica qué mirror sirvió el archivo y, entre corchetes, los que fallaron antes
    (`[antes: catboy:corte]`). Un mirror que falla 3 mapas seguidos se aparta unos minutos y BeatBack avisa.
 4. Un corte de conexión a mitad de archivo ya no detiene el programa: se reintenta con otro mirror.
+
+## Mirrors y niveles de preferencia
+
+Cada mirror tiene un `tier` (0 = primero). BeatBack usa los de nivel bajo mientras estén disponibles y recurre a los
+de nivel alto solo cuando los anteriores están ocupados, en pausa o no tienen el mapa. Lista por defecto (desde 0.2.2):
+
+| Nivel | Mirror | Notas (medidas en una conexión real, noviembre 2026) |
+|---|---|---|
+| 0 | catboy.best | Rápido (~2 MB/s). **Exige identificarse** con nombre, versión y dirección: BeatBack lo hace (`USER_AGENT`). |
+| 1 | sayobot | Funciona, pero lento (0,07 a 0,2 MB/s) y con cortes ocasionales. |
+| 2 | osu.direct | Rápido, pero entrega el mapa **con video** y informa cupos (descargas y datos). BeatBack los lee y se pausa solo. |
+| 3 | nerinyan | En las pruebas respondió `not_found` para mapas que existen: falla de su lado. |
+
+Por defecto la lista **no se guarda** en `config.json`, así las mejoras de cada versión llegan solas. Si la editas, tu
+versión se respeta. Cada entrada: `name`, `tier`, `url_novideo`, `url_full` (con `{id}` donde va el número del set).
+Si algún mirror devuelve 403, no intentes saltártelo: es su forma de decidir quién puede descargar.
+Antes de una descarga masiva, revisa las condiciones de uso de cada mirror.
 
 ## Historial y velocidad
 

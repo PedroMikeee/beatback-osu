@@ -21,11 +21,12 @@ MISS_LIMIT = 15        # veces seguidas que dice "no lo tengo" mientras otro mir
 class MirrorPool:
     """Reparte las peticiones entre mirrors, respeta su pausa mínima y aparta a los que fallan."""
 
-    def __init__(self, mirrors, no_video, min_interval):
+    def __init__(self, mirrors, no_video, min_interval, ua=None):
         key = "url_novideo" if no_video else "url_full"
-        self.items = [{"name": m["name"], "url": m[key], "next": 0.0, "fails": 0, "misses": 0, "bench_n": 0,
-                       "n_ok": 0, "n_err": 0, "n_404": 0} for m in mirrors]
+        self.items = [{"name": m["name"], "url": m[key], "tier": int(m.get("tier", 0)), "next": 0.0, "fails": 0,
+                       "misses": 0, "bench_n": 0, "n_ok": 0, "n_err": 0, "n_404": 0, "budget": ""} for m in mirrors]
         self.min_interval = float(min_interval)
+        self.ua = ua or UA
         self.lock = threading.Lock()
         self.events = []          # avisos para mostrar en pantalla
 
@@ -52,9 +53,45 @@ class MirrorPool:
             m["next"] = max(m["next"], time.monotonic() + secs)
 
     def ordered(self):
-        """Mirrors ordenados por disponibilidad: el que lleva más tiempo sin usarse va primero."""
+        """Orden de prueba. Los mirrors que estarán libres en pocos segundos van primero, por nivel de preferencia
+        (tier) y, a igual nivel, el que lleva más tiempo sin usarse (reparte la carga). Los demás, después."""
         with self.lock:
-            return sorted(self.items, key=lambda m: m["next"])
+            now = time.monotonic()
+            window = max(3.0, 2 * self.min_interval)
+            return sorted(self.items, key=lambda m: (m["next"] - now > window, m["tier"], m["next"]))
+
+    def exhaust(self, m, secs, what):
+        """El mirror avisó de que se agotó un cupo: pausa hasta que se renueve."""
+        secs = min(max(secs, 30.0), 6 * 3600.0)
+        with self.lock:
+            until = time.monotonic() + secs
+            if m["next"] >= until - 1:
+                return
+            m["next"] = until
+            hhmm = time.strftime("%H:%M", time.localtime(time.time() + secs))
+            self._event(f"AVISO: {m['name']} agotó su {what}; en pausa hasta ~{hhmm}.")
+
+    def note_headers(self, m, r):
+        """Lee los cupos que algunos mirrors (osu.direct) informan en las cabeceras, incluso las de la redirección."""
+        h = {}
+        for resp in list(r.history) + [r]:
+            for k, v in resp.headers.items():
+                h[k.lower()] = v
+
+        def num(key):
+            try:
+                return float(h[key])
+            except (KeyError, ValueError):
+                return None
+        rem, lim, reset = num("x-download-budget-remaining"), num("x-download-budget-limit"), num("x-download-budget-reset")
+        brem, breset = num("x-download-budget-bytes-remaining"), num("x-download-budget-bytes-reset")
+        if rem is not None:
+            with self.lock:
+                m["budget"] = f"{rem:.0f}/{lim:.0f}" if lim else f"{rem:.0f}"
+            if rem <= 1 and reset:
+                self.exhaust(m, reset - time.time(), "cupo de descargas")
+        if brem is not None and brem < 40 * 1048576 and breset:     # queda menos de ~40 MB: pausa preventiva
+            self.exhaust(m, breset - time.time(), "cupo diario de datos")
 
     def soonest(self):
         with self.lock:
@@ -141,13 +178,14 @@ def fetch_set(set_id, dest: Path, pool: MirrorPool, session, rounds=4):
                 time.sleep(wait)
             t0 = time.monotonic()
             try:
-                r = session.get(m["url"].format(id=set_id), headers={"User-Agent": UA},
+                r = session.get(m["url"].format(id=set_id), headers={"User-Agent": pool.ua},
                                 stream=True, timeout=TIMEOUT)
             except (requests.RequestException, OSError) as e:
                 bad(m, "red", f"{m['name']}: sin conexión ({type(e).__name__})")
                 continue
             try:
                 with r:
+                    pool.note_headers(m, r)
                     code = r.status_code
                     if code == 200:
                         ok, info = _save(r, dest)
@@ -174,24 +212,27 @@ def fetch_set(set_id, dest: Path, pool: MirrorPool, session, rounds=4):
     return "failed", "; ".join(t[2] for t in trail[-4:]) or "sin respuesta", None, _notes(trail), 0.0
 
 
-def probe(url_template, set_id, session, max_secs=60):
+def probe(url_template, set_id, session, max_secs=60, ua=None):
     """Prueba un mirror con un mapa (sin guardarlo). Devuelve un diccionario con el veredicto."""
-    t0, size, head = time.monotonic(), 0, b""
+    t0, size, head, budget = time.monotonic(), 0, b"", ""
     try:
-        with session.get(url_template.format(id=set_id), headers={"User-Agent": UA},
+        with session.get(url_template.format(id=set_id), headers={"User-Agent": ua or UA},
                          stream=True, timeout=TIMEOUT) as r:
+            hh = {k.lower(): v for resp in list(r.history) + [r] for k, v in resp.headers.items()}
+            if "x-download-budget-remaining" in hh:
+                budget = f"cupo {hh['x-download-budget-remaining']}/{hh.get('x-download-budget-limit', '?')}"
             if r.status_code != 200:
                 v = "no tiene este mapa" if r.status_code in (404, 410) else f"respondió HTTP {r.status_code}"
-                return {"verdict": v, "secs": time.monotonic() - t0, "size": 0}
+                return {"verdict": v, "secs": time.monotonic() - t0, "size": 0, "budget": budget}
             for chunk in r.iter_content(65536):
                 head = head or chunk[:4]
                 size += len(chunk)
                 if time.monotonic() - t0 > max_secs:
-                    return {"verdict": f"demasiado lento (cortado a los {max_secs} s)", "secs": time.monotonic() - t0, "size": size}
+                    return {"verdict": f"demasiado lento (cortado a los {max_secs} s)", "secs": time.monotonic() - t0, "size": size, "budget": budget}
     except (requests.RequestException, OSError) as e:
-        return {"verdict": f"error ({type(e).__name__})", "secs": time.monotonic() - t0, "size": size}
+        return {"verdict": f"error ({type(e).__name__})", "secs": time.monotonic() - t0, "size": size, "budget": budget}
     ok = head == b"PK\x03\x04" and size >= MIN_SIZE
-    return {"verdict": "OK" if ok else "respuesta inválida", "secs": time.monotonic() - t0, "size": size}
+    return {"verdict": "OK" if ok else "respuesta inválida", "secs": time.monotonic() - t0, "size": size, "budget": budget}
 
 
 def safe_name(artist, title, sid):
@@ -213,7 +254,7 @@ def _fmt_time(secs):
 def run(cfg, state, rows, stop: threading.Event, say=print):
     """Descarga las filas con N hilos. Cada resultado se guarda en la base apenas termina.
     Devuelve (conteos, estadísticas)."""
-    pool = MirrorPool(cfg["mirrors"], cfg["no_video"], cfg["min_interval"])
+    pool = MirrorPool(cfg["mirrors"], cfg["no_video"], cfg["min_interval"], cfg.get("user_agent"))
     local = threading.local()
     total, done_n = len(rows), 0
     counts = {"done": 0, "not_found": 0, "failed": 0}
@@ -265,5 +306,5 @@ def run(cfg, state, rows, stop: threading.Event, say=print):
     finally:
         ex.shutdown(wait=True, cancel_futures=True)
     stats["secs"] = time.monotonic() - t0
-    stats["pool"] = [(m["name"], m["n_ok"], m["n_err"], m["n_404"]) for m in pool.items]
+    stats["pool"] = [(m["name"], m["n_ok"], m["n_err"], m["n_404"], m["budget"]) for m in pool.items]
     return counts, stats
