@@ -6,6 +6,8 @@ import getpass
 import threading
 from pathlib import Path
 
+import requests
+
 from . import __version__, config, downloader
 from .api import ApiError, OsuClient
 from .db import State
@@ -88,6 +90,12 @@ def cmd_download(args):
     cfg = config.load()
     if args.concurrencia:
         cfg["concurrency"] = args.concurrencia
+    if args.mirror:
+        names = [m["name"] for m in cfg["mirrors"]]
+        unknown = [n for n in args.mirror if n not in names]
+        if unknown:
+            raise SystemExit(f"Mirror desconocido: {', '.join(unknown)}. Disponibles: {', '.join(names)}")
+        cfg["mirrors"] = [m for m in cfg["mirrors"] if m["name"] in args.mirror]
     st = _state()
     rows = st.queue(args.bloque, args.reintentar, args.limite)
     if not rows:
@@ -97,8 +105,27 @@ def cmd_download(args):
     counts, stats = downloader.run(cfg, st, rows, threading.Event())
     print(f"Listo: {counts['done']} descargados, {counts['not_found']} no disponibles, {counts['failed']} con error.")
     if stats["bytes"]:
-        mirrors = ", ".join(f"{k}: {v}" for k, v in sorted(stats["mirrors"].items()))
-        print(f"Total: {fmt_size(stats['bytes'] / 1048576)} en {downloader._fmt_time(stats['secs'])}. Por mirror -> {mirrors}")
+        print(f"Total: {fmt_size(stats['bytes'] / 1048576)} en {downloader._fmt_time(stats['secs'])}.")
+    print("Por mirror:")
+    for name, ok, err, miss in stats["pool"]:
+        print(f"  {name:<10} {ok} descargados, {err} errores, {miss} 'no lo tengo'")
+
+
+def cmd_mirrors(args):
+    """Prueba cada mirror con uno o dos mapas de tu lista y dice cuál conviene."""
+    cfg = config.load()
+    ids = args.id or [r["id"] for r in _state().all_rows()[:2]] or [41823]
+    print(f"Probando {len(cfg['mirrors'])} mirrors con los mapas {', '.join(map(str, ids))} (máx. 60 s cada uno)...")
+    session = requests.Session()
+    for m in cfg["mirrors"]:
+        url = m["url_novideo" if cfg["no_video"] else "url_full"]
+        for sid in ids:
+            r = downloader.probe(url, sid, session)
+            mb = r["size"] / 1048576
+            speed = f"{mb / r['secs']:.2f} MB/s" if r["size"] and r["secs"] > 0.05 else "-"
+            print(f"  {m['name']:<10} mapa {sid:<9} {r['verdict']:<34} {r['secs']:>5.1f} s  {mb:>5.1f} MB  {speed}", flush=True)
+    print("Consejo: si un mirror falla o es muy lento con todos los mapas, déjalo al final de la lista 'mirrors' "
+          "en config.json o usa: beatback download --mirror NOMBRE")
 
 
 def cmd_status(args):
@@ -162,7 +189,12 @@ def main(argv=None):
     d.add_argument("--limite", type=int, help="solo N mapas (para probar)")
     d.add_argument("--reintentar", action="store_true", help="reintentar también los fallidos")
     d.add_argument("--concurrencia", type=int, help="descargas simultáneas")
+    d.add_argument("--mirror", nargs="+", help="usar solo estos mirrors (ej: --mirror sayobot)")
     d.set_defaults(fn=cmd_download)
+
+    m = sub.add_parser("mirrors", help="prueba cada mirror y muestra cuál funciona y a qué velocidad")
+    m.add_argument("--id", type=int, action="append", help="id de un beatmapset para probar (repetible)")
+    m.set_defaults(fn=cmd_mirrors)
 
     sub.add_parser("status", help="muestra el progreso").set_defaults(fn=cmd_status)
 

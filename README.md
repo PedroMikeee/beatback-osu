@@ -31,6 +31,7 @@ pip install -e .
 beatback init                      # credenciales y carpeta de descarga
 beatback plan                      # lee tu historial y arma la lista (no descarga nada)
 beatback list                      # VER la lista en pantalla (por defecto los 50 más jugados; --limite 0 = todos)
+beatback mirrors                   # prueba cada mirror: ¿responde?, ¿a qué velocidad? (hazlo ANTES de descargar mucho)
 beatback download --limite 5       # PRUEBA con 5 mapas antes de lanzar todo
 beatback download                  # descarga todo lo pendiente (Ctrl+C pausa; vuelve a ejecutar para seguir)
 beatback status                    # progreso por bloque
@@ -44,6 +45,15 @@ Filtros de `plan`: `--modo osu|taiko|fruits|mania|todos` (por defecto `osu`), `-
 
 **Sobre los años:** la lista de "más jugados" de osu! no indica *cuándo* jugaste cada mapa. `--desde/--hasta`
 filtran por el año de **publicación del mapa**, que solo es una aproximación.
+
+## Si la descarga va lenta o falla
+
+1. Ejecuta `beatback mirrors`: prueba cada mirror con mapas de tu lista y muestra si responde, cuánto tarda y a qué MB/s.
+2. Si uno falla o es muy lento, descarga solo con los buenos: `beatback download --mirror sayobot`
+   (o deja el malo al final de la lista `mirrors` en `config.json`).
+3. Durante la descarga, cada línea indica qué mirror sirvió el archivo y, entre corchetes, los que fallaron antes
+   (`[antes: catboy:corte]`). Un mirror que falla 3 mapas seguidos se aparta unos minutos y BeatBack avisa.
+4. Un corte de conexión a mitad de archivo ya no detiene el programa: se reintenta con otro mirror.
 
 ## Historial y velocidad
 

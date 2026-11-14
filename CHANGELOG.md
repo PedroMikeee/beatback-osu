@@ -1,5 +1,14 @@
 # Cambios
 
+## 0.2.1
+- **Corrección:** un corte o timeout a mitad de una descarga ya no cierra el programa con un traceback; se reintenta con otro mirror.
+- Un mirror que falla 3 mapas seguidos (o dice "no lo tengo" a mapas que otros sí tienen) se aparta unos minutos, con aviso en pantalla.
+- Un mapa defectuoso castiga al mirror una sola vez; con un único mirror configurado no se aparta nunca.
+- Espera máxima por falta de datos: 30 s (antes 60 s), para que un mirror colgado cueste menos.
+- Cada línea muestra los mirrors que fallaron antes (`[antes: nerinyan:404]`); la velocidad (MB/s) mide solo la descarga, sin esperas.
+- Nuevo `beatback mirrors`: diagnóstico de cada mirror. Nuevo `beatback download --mirror NOMBRE`.
+- Resumen final por mirror: descargados, errores y "no lo tengo".
+
 ## 0.2.0
 - Las descargas se reparten entre los mirrors en lugar de usar siempre el primero (más rápido, misma cortesía por mirror).
 - Se registra qué mirror sirvió cada archivo y en cuánto tiempo; la salida muestra MB/s y tiempo restante.

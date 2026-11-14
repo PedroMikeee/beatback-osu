@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -49,6 +50,7 @@ ZIP_BYTES = ZIP_BYTES.getvalue()
 
 class Fake(BaseHTTPRequestHandler):
     seen_429 = set()
+    hits = Counter()
     lock = threading.Lock()
 
     def log_message(self, *a):
@@ -81,9 +83,19 @@ class Fake(BaseHTTPRequestHandler):
                 q = parse_qs(u.query)
                 off, lim = int(q["offset"][0]), int(q["limit"][0])
                 return self._send(200, json.dumps(ITEMS[off:off + lim]).encode())
-        m = re.match(r"/(m1|m2)/d/(\d+)", u.path)
+        m = re.match(r"/(m1|m2|m3)/d/(\d+)", u.path)
         if m:
             mirror, sid = m.group(1), int(m.group(2))
+            with Fake.lock:
+                Fake.hits[mirror] += 1
+            if mirror == "m3":
+                return self._send(500)                          # mirror caído
+            if mirror == "m1" and 1050 <= sid <= 1059:          # corte a mitad de la descarga
+                self.send_response(200)
+                self.send_header("Content-Length", "5000")
+                self.end_headers()
+                self.wfile.write(b"PK\x03\x04" + b"x" * 100)
+                return
             if sid == NOT_FOUND:
                 return self._send(404)
             if sid == BAD_HTML and mirror == "m1":
@@ -111,6 +123,7 @@ class Base(unittest.TestCase):
 
     def setUp(self):
         Fake.seen_429.clear()
+        Fake.hits.clear()
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["BEATBACK_HOME"] = str(Path(self.tmp.name) / "cfg")
         self.addCleanup(self.tmp.cleanup)
@@ -217,7 +230,9 @@ class TestFlujoCompleto(Base):
 
 class TestVersion02(Base):
     def test_reparte_entre_mirrors_y_registra_cual_sirvio(self):
-        self.cfg()
+        c = self.cfg()
+        c["min_interval"] = 0.05          # pausas reales: así los turnos rotan entre mirrors
+        config.save(c)
         self.run_cli("plan")
         out = self.run_cli("download")
         self.assertIn("Por mirror", out)
@@ -274,6 +289,68 @@ class TestVersion02(Base):
     def test_formato_de_tamano(self):
         self.assertEqual(cli.fmt_size(15), "15 MB")
         self.assertEqual(cli.fmt_size(2048), "2.0 GB")
+
+
+class TestVersion021(Base):
+    def _pool(self, *names):
+        from beatback.downloader import MirrorPool
+        return MirrorPool([{"name": n, "url_novideo": f"{self.base}/{n}/d/{{id}}", "url_full": ""} for n in names], True, 0)
+
+    def test_corte_a_mitad_de_descarga_no_tumba_el_programa(self):
+        import requests
+        from beatback.downloader import fetch_set
+        dest = self.out / "bloque_001" / "1050.osz"
+        res = fetch_set(1050, dest, self._pool("m1"), requests.Session(), rounds=1)    # no lanza excepción
+        self.assertEqual(res[0], "failed")
+        self.assertIn("se cortó", res[1])
+        self.assertFalse(dest.exists())
+        self.assertEqual(list(self.out.rglob("*.part")), [])
+
+    def test_corte_con_otro_mirror_de_respaldo_termina_bien(self):
+        import requests
+        from beatback.downloader import fetch_set
+        dest = self.out / "bloque_001" / "1051.osz"
+        st, info, mirror, notes, secs = fetch_set(1051, dest, self._pool("m1", "m2"), requests.Session(), rounds=1)
+        self.assertEqual((st, mirror), ("done", "m2"))
+        self.assertIn("m1:corte", notes)
+        self.assertGreater(secs, 0)
+
+    def test_mirror_caido_se_pone_en_pausa_y_no_frena_el_resto(self):
+        c = self.cfg(mirrors=("m3", "m2"))
+        c["concurrency"] = 1
+        config.save(c)
+        self.run_cli("plan")
+        out = self.run_cli("download")
+        self.assertIn("101 descargados", out)
+        self.assertIn("en pausa", out)
+        self.assertIn("m3:HTTP500", out)               # se ve por qué falló
+        self.assertLess(Fake.hits["m3"], 12)           # tras 3 mapas fallidos deja de insistir (no ~100 visitas)
+
+    def test_opcion_mirror_usa_solo_el_elegido(self):
+        self.cfg()
+        self.run_cli("plan", "--prueba", "8")
+        self.run_cli("download", "--mirror", "m2")
+        self.assertEqual(Fake.hits["m1"], 0)
+        rows = State(config.config_dir() / "beatback.db").all_rows()
+        self.assertEqual({r["mirror"] for r in rows if r["state"] == "done"}, {"m2"})
+        with self.assertRaises(SystemExit):
+            self.run_cli("download", "--mirror", "no-existe")
+
+    def test_comando_mirrors_diagnostica_cada_uno(self):
+        c = self.cfg(mirrors=("m1", "m2", "m3"))
+        self.run_cli("plan", "--prueba", "3")
+        out = self.run_cli("mirrors", "--id", "1000", "--id", "900")
+        self.assertRegex(out, r"m1\s+mapa 1000\s+OK")
+        self.assertRegex(out, r"m2\s+mapa 900\s+no tiene este mapa")
+        self.assertRegex(out, r"m3\s+mapa 1000\s+respondió HTTP 500")
+
+    def test_un_solo_mirror_con_mapa_malo_no_se_pone_en_pausa(self):
+        import time
+        self.cfg(mirrors=("m1",))
+        self.run_cli("plan", "--prueba", "2")           # 900 (404) y 901 (respuesta inválida en m1)
+        t0 = time.monotonic()
+        self.run_cli("download", "--concurrencia", "1")
+        self.assertLess(time.monotonic() - t0, 30)      # antes se quedaba esperando minutos
 
 
 if __name__ == "__main__":
